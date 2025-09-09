@@ -256,24 +256,34 @@ bot.action('photos_done', async (ctx) => {
 });
 
 /* ========= START: WEBHOOK or POLLING ========= */
+const PORT = process.env.PORT || 3000;            // <-- не задаём в env вручную
+
 if (WEBHOOK_HOST) {
   const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
   app.use(express.json());
 
-  // health & GET-checks (чтобы Telegram/браузер не видели 404)
+  // health & GET-checks
   app.get('/', (_, res) => res.status(200).send('OK'));
   app.get(path, (_, res) => res.status(200).send('OK'));
 
   // основной обработчик вебхука (POST)
   app.post(path, bot.webhookCallback(path));
 
-  // регистрируем webhook в Telegram
+  // регистрируем webhook (без лишних перезапросов порта)
   bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
 
-  app.listen(PORT, () => console.log(`✅ Webhook server on ${PORT}, path=${path}`));
+  // запускаем HTTP-сервер на выданном Render порту
+  const server = app.listen(PORT, () => {
+    console.log(`✅ Webhook server on ${PORT}, path=${path}`);
+  });
+  server.on('error', (err) => {
+    console.error('HTTP server error:', err);
+    process.exit(1);
+  });
 } else {
-  // fallback: polling (удобно для локальной отладки)
+  // fallback: polling
   bot.launch().then(() => console.log('✅ Bot started in polling mode'));
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
+
