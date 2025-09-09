@@ -1,17 +1,18 @@
+// index.js
 import 'dotenv/config';
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import fetch from 'node-fetch';
 import { OpenAI } from 'openai';
 
-// ---------- ENV ----------
+/* ========= ENV ========= */
 const {
   BOT_TOKEN,
   OPENAI_API_KEY,
   OPENAI_VISION_MODEL = 'gpt-4o-mini',
   PORT = 10000,
-  WEBHOOK_HOST,
-  WEBHOOK_PATH_SECRET = 'hook'
+  WEBHOOK_HOST,                 // пример: https://realtor-bot-t70.onrender.com  (без слэша в конце)
+  WEBHOOK_PATH_SECRET = 'hook', // пример: mysecretpath
 } = process.env;
 
 if (!BOT_TOKEN || !OPENAI_API_KEY) {
@@ -19,19 +20,57 @@ if (!BOT_TOKEN || !OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// ---------- INIT ----------
+/* ========= CORE ========= */
 const app = express();
 const bot = new Telegraf(BOT_TOKEN);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ---------- простая сессия ----------
+/* ========= PRIMITIVE SESSION ========= */
 const sessions = new Map();
-const getSession = (id) =>
-  sessions.get(id) ||
-  (sessions.set(id, { step: 'idle', payload: {}, photos: [] }), sessions.get(id));
-const resetSession = (id) => sessions.set(id, { step: 'idle', payload: {}, photos: [] });
+function getSession(chatId) {
+  if (!sessions.has(chatId)) {
+    sessions.set(chatId, { step: 'idle', payload: {}, photos: [] });
+  }
+  return sessions.get(chatId);
+}
+function resetSession(chatId) {
+  sessions.set(chatId, { step: 'idle', payload: {}, photos: [] });
+}
 
-// ---------- утилиты ----------
+/* ========= HELPERS ========= */
+function chunkText(str, size = 3500) {
+  const parts = [];
+  let s = str || '';
+  while (s.length > size) {
+    let i = s.lastIndexOf('\n', size);
+    if (i < 0) i = size;
+    parts.push(s.slice(0, i));
+    s = s.slice(i);
+  }
+  if (s) parts.push(s);
+  return parts;
+}
+
+function parseMeta(text = '') {
+  const pick = (label) => (text.match(new RegExp(`\\*?${label}\\*?\\s*:\\s*([^\\n]+)`, 'i')) || [, ''])[1].trim();
+  const num = (s) => (s || '').replace(',', '.').match(/[0-9.]+/)?.[0] || '';
+  return {
+    address: pick('Адрес'),
+    district: pick('Район'),
+    totalArea: num(pick('Площадь')),
+    layout: pick('Планировка'),
+    floor: pick('Этаж'),
+    floorsTotal: pick('Этажность дома'),
+    ceilingHeight: pick('Потолки'),
+    communications: pick('Коммуникации'),
+    extras: pick('Особенности локации'),
+    petsPolicy: pick('Животные'),
+    availableFrom: pick('Доступно с'),
+    price: pick('Цена'),
+    contact: pick('Контакт'),
+  };
+}
+
 async function tgFileToDataUrl(ctx, fileId) {
   const file = await ctx.telegram.getFile(fileId);
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
@@ -41,6 +80,7 @@ async function tgFileToDataUrl(ctx, fileId) {
   return `data:${mime};base64,${buf.toString('base64')}`;
 }
 
+/* ========= OPENAI: VISION EXTRACT ========= */
 const FEATURE_SCHEMA = {
   type: "object",
   properties: {
@@ -57,11 +97,11 @@ const FEATURE_SCHEMA = {
 
 async function openaiExtractFeatures(imageDataUrls) {
   const messages = [
-    { role: "system", content: [{ type: "text", text: "Ты помощник по недвижимости. Верни ТОЛЬКО валидный JSON по схеме." }] },
+    { role: "system", content: [{ type: "text", text: "Ты помощник по недвижимости. Верни ТОЛЬКО валидный JSON по схеме без пояснений." }] },
     {
       role: "user",
       content: [
-        { type: "text", text: `Схема:\n${JSON.stringify(FEATURE_SCHEMA, null, 2)}\nВерни чистый JSON без пояснений.` },
+        { type: "text", text: `Схема:\n${JSON.stringify(FEATURE_SCHEMA, null, 2)}\nВерни чистый JSON.` },
         ...imageDataUrls.map(u => ({ type: "image_url", image_url: { url: u, detail: "high" } }))
       ]
     }
@@ -75,45 +115,19 @@ async function openaiExtractFeatures(imageDataUrls) {
   }
 }
 
-function chunk(txt, n = 3500) {
-  const out = []; let s = txt || '';
-  while (s.length > n) { let i = s.lastIndexOf('\n', n); if (i < 0) i = n; out.push(s.slice(0, i)); s = s.slice(i); }
-  if (s) out.push(s);
-  return out;
-}
-
-function parseMeta(text = '') {
-  const g = (l) => (text.match(new RegExp(`\\*?${l}\\*?\\s*:\\s*([^\\n]+)`, 'i')) || [, ''])[1].trim();
-  const num = (s) => (s || '').replace(',', '.').match(/[0-9.]+/)?.[0] || '';
-  return {
-    address: g('Адрес'),
-    district: g('Район'),
-    totalArea: num(g('Площадь')),
-    layout: g('Планировка'),
-    floor: g('Этаж'),
-    floorsTotal: g('Этажность дома'),
-    ceilingHeight: g('Потолки'),
-    communications: g('Коммуникации'),
-    extras: g('Особенности локации'),
-    petsPolicy: g('Животные'),
-    availableFrom: g('Доступно с'),
-    price: g('Цена'),
-    contact: g('Контакт')
-  };
-}
-
+/* ========= OPENAI: COPY ========= */
 function buildListingPrompt(meta, feats) {
   return `
 Составь объявление. Цель: ${meta.dealType}. Язык: ${meta.language}.
-Данные: ${JSON.stringify(meta)}
+Данные (мета): ${JSON.stringify(meta)}
 Признаки по фото: ${JSON.stringify(feats)}
 Структура:
 1) 3 коротких заголовка;
-2) Плюсы (5–8);
+2) Плюсы (5–8 буллетов);
 3) Минусы (2–5);
-4) Основной текст (6–10 предложений, под цель);
+4) Основной текст 6–10 предложений с учетом цели (продажа/аренда/презентация);
 5) Хэштеги (10–15, одной строкой);
-6) Призыв к действию + контакт: ${meta.contact || 'пишите в чат'}.
+6) Призыв к действию с контактом: ${meta.contact || 'пишите в чат'}.
 `.trim();
 }
 
@@ -121,7 +135,7 @@ async function openaiBuildListing(meta, feats) {
   const r = await openai.chat.completions.create({
     model: OPENAI_VISION_MODEL,
     messages: [
-      { role: 'system', content: [{ type: 'text', text: 'Ты проф. копирайтер по недвижимости. Пиши ёмко и честно.' }] },
+      { role: 'system', content: [{ type: 'text', text: 'Ты проф. копирайтер по недвижимости. Пиши ёмко и честно, без воды.' }] },
       { role: 'user', content: [{ type: 'text', text: buildListingPrompt(meta, feats) }] }
     ],
     temperature: 0.4
@@ -129,7 +143,7 @@ async function openaiBuildListing(meta, feats) {
   return r.choices?.[0]?.message?.content || '';
 }
 
-// ---------- UI ----------
+/* ========= UI ========= */
 const dealKb = Markup.inlineKeyboard([
   [Markup.button.callback('Продажа', 'deal_sale'), Markup.button.callback('Аренда', 'deal_rent')],
   [Markup.button.callback('Презентация', 'deal_promo')]
@@ -140,7 +154,7 @@ const langKb = Markup.inlineKeyboard([
 ]);
 const doneKb = Markup.inlineKeyboard([[Markup.button.callback('Готово, фото загружены ✅', 'photos_done')]]);
 
-// ---------- сценарий ----------
+/* ========= SCENARIO ========= */
 bot.start(async (ctx) => {
   resetSession(ctx.chat.id);
   await ctx.replyWithMarkdown('Привет! Я *Бот риелтор*. Набери */new* чтобы начать.');
@@ -185,7 +199,8 @@ bot.action(['lang_ru', 'lang_sr', 'lang_en'], async (ctx) => {
 *Цена:* ...
 *Контакт:* ...
 
-Потом пришли 3–12 фото (можно альбомом).`);
+После этого пришли 3–12 фото (можно альбомом).`
+  );
 });
 
 bot.on('text', async (ctx, next) => {
@@ -216,17 +231,21 @@ bot.action('photos_done', async (ctx) => {
 
   await ctx.editMessageText(`Фото получены: ${s.photos.length}. Анализирую…`);
   try {
-    const urls = [];
-    for (const p of s.photos.slice(0, 12)) urls.push(await tgFileToDataUrl(ctx, p.file_id));
+    const imgs = [];
+    for (const p of s.photos.slice(0, 12)) imgs.push(await tgFileToDataUrl(ctx, p.file_id));
+
     await ctx.reply('🔎 Извлекаю признаки…');
-    const feats = await openaiExtractFeatures(urls);
+    const feats = await openaiExtractFeatures(imgs);
+
     await ctx.reply('📝 Собираю текст…');
     const text = await openaiBuildListing(s.payload, feats);
 
     await ctx.replyWithMarkdown('*Извлечённые признаки (JSON):*');
     await ctx.reply('```\n' + JSON.stringify(feats, null, 2) + '\n```', { parse_mode: 'Markdown' });
+
     await ctx.replyWithMarkdown('*Готовый текст объявления:*');
-    for (const part of chunk(text, 3500)) await ctx.reply(part);
+    for (const part of chunkText(text, 3500)) await ctx.reply(part);
+
     await ctx.reply('Готово ✅ /new чтобы начать заново');
   } catch (e) {
     console.error(e);
@@ -236,39 +255,25 @@ bot.action('photos_done', async (ctx) => {
   }
 });
 
-// ---------- запуск: webhook или polling ----------
+/* ========= START: WEBHOOK or POLLING ========= */
 if (WEBHOOK_HOST) {
   const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
   app.use(express.json());
 
-  // healthchecks (чтобы не было 404)
+  // health & GET-checks (чтобы Telegram/браузер не видели 404)
   app.get('/', (_, res) => res.status(200).send('OK'));
   app.get(path, (_, res) => res.status(200).send('OK'));
 
-  // обработчик Telegram (POST)
+  // основной обработчик вебхука (POST)
   app.post(path, bot.webhookCallback(path));
 
-  // регистрируем вебхук
+  // регистрируем webhook в Telegram
   bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
 
   app.listen(PORT, () => console.log(`✅ Webhook server on ${PORT}, path=${path}`));
 } else {
+  // fallback: polling (удобно для локальной отладки)
   bot.launch().then(() => console.log('✅ Bot started in polling mode'));
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
-const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
-app.use(express.json());
-
-// Эти два GET-роута нужны, чтобы не было 404 при проверках браузером/Телеграмом
-app.get('/', (_, res) => res.status(200).send('OK'));
-app.get(path, (_, res) => res.status(200).send('OK'));
-
-// ВАЖНО: сам обработчик POST на вебхуке
-app.post(path, bot.webhookCallback(path));
-
-// Установка вебхука
-bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
-
-app.listen(PORT, () => console.log(`✅ Webhook server on ${PORT}, path=${path}`));
-
