@@ -166,4 +166,94 @@ bot.action(['lang_ru', 'lang_sr', 'lang_en'], async (ctx) => {
   const s = getSession(ctx.chat.id);
   if (s.step !== 'lang') return ctx.answerCbQuery();
   s.payload.language = { lang_ru: 'ru', lang_sr: 'sr', lang_en: 'en' }[ctx.callbackQuery.data];
-  s.step =
+  s.step = 'meta';
+  await ctx.editMessageText(`Язык: ${s.payload.language}`);
+  await ctx.replyWithMarkdown(
+`Пришли **метаданные** одним сообщением по образцу:
+
+*Адрес:* ...
+*Район:* ...
+*Площадь:* 45
+*Планировка:* 1к
+*Этаж:* 3
+*Этажность дома:* 9
+*Потолки:* 2.7
+*Коммуникации:* ...
+*Особенности локации:* ...
+*Животные:* ...
+*Доступно с:* ...
+*Цена:* ...
+*Контакт:* ...
+
+Потом пришли 3–12 фото (можно альбомом).`);
+});
+
+bot.on('text', async (ctx, next) => {
+  const s = getSession(ctx.chat.id);
+  if (s.step === 'meta') {
+    s.payload = { ...s.payload, ...parseMeta(ctx.message.text) };
+    s.step = 'collect_photos';
+    await ctx.reply('Принял метаданные. Пришли 3–12 фото. Когда закончишь — нажми кнопку.', doneKb);
+    return;
+  }
+  return next();
+});
+
+bot.on('photo', async (ctx, next) => {
+  const s = getSession(ctx.chat.id);
+  if (s.step !== 'collect_photos') return next();
+  const best = (ctx.message.photo || []).sort((a, b) => (b.file_size || 0) - (a.file_size || 0))[0];
+  if (best) {
+    s.photos.push({ file_id: best.file_id });
+    await ctx.reply(`Фото добавлено ✅ (всего: ${s.photos.length})`, { reply_to_message_id: ctx.message.message_id });
+  }
+});
+
+bot.action('photos_done', async (ctx) => {
+  const s = getSession(ctx.chat.id);
+  if (s.step !== 'collect_photos') return ctx.answerCbQuery();
+  if (s.photos.length < 1) return ctx.answerCbQuery('Сначала пришли фото', { show_alert: true });
+
+  await ctx.editMessageText(`Фото получены: ${s.photos.length}. Анализирую…`);
+  try {
+    const urls = [];
+    for (const p of s.photos.slice(0, 12)) urls.push(await tgFileToDataUrl(ctx, p.file_id));
+    await ctx.reply('🔎 Извлекаю признаки…');
+    const feats = await openaiExtractFeatures(urls);
+    await ctx.reply('📝 Собираю текст…');
+    const text = await openaiBuildListing(s.payload, feats);
+
+    await ctx.replyWithMarkdown('*Извлечённые признаки (JSON):*');
+    await ctx.reply('```\n' + JSON.stringify(feats, null, 2) + '\n```', { parse_mode: 'Markdown' });
+    await ctx.replyWithMarkdown('*Готовый текст объявления:*');
+    for (const part of chunk(text, 3500)) await ctx.reply(part);
+    await ctx.reply('Готово ✅ /new чтобы начать заново');
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('❌ Ошибка. Проверь ключи/переменные и попробуй /new');
+  } finally {
+    resetSession(ctx.chat.id);
+  }
+});
+
+// ---------- запуск: webhook или polling ----------
+if (WEBHOOK_HOST) {
+  const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
+  app.use(express.json());
+
+  // healthchecks (чтобы не было 404)
+  app.get('/', (_, res) => res.status(200).send('OK'));
+  app.get(path, (_, res) => res.status(200).send('OK'));
+
+  // обработчик Telegram (POST)
+  app.post(path, bot.webhookCallback(path));
+
+  // регистрируем вебхук
+  bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
+
+  app.listen(PORT, () => console.log(`✅ Webhook server on ${PORT}, path=${path}`));
+} else {
+  bot.launch().then(() => console.log('✅ Bot started in polling mode'));
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+}
