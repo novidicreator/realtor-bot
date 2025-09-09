@@ -1,289 +1,303 @@
 // index.js
+// Единый файл: Telegram + Express + OpenAI Vision
+// Требуемые ENV (Render → Environment):
+// - BOT_TOKEN
+// - OPENAI_API_KEY
+// - OPENAI_VISION_MODEL (опц., по умолчанию gpt-4o-mini)
+// - WEBHOOK_HOST  (например: https://realtor-bot-xxxx.onrender.com)
+// - WEBHOOK_PATH_SECRET  (например: mysecretpath)
+// ─────────────────────────────────────────────────────────────────────────────
+
 import 'dotenv/config';
 import express from 'express';
-import { Telegraf, Markup } from 'telegraf';
-import fetch from 'node-fetch';
-import { OpenAI } from 'openai';
+import { Telegraf } from 'telegraf';
+import OpenAI from 'openai';
 
-/* ========= ENV ========= */
+// ─────────── Настройки из окружения ───────────
 const {
   BOT_TOKEN,
   OPENAI_API_KEY,
   OPENAI_VISION_MODEL = 'gpt-4o-mini',
-  WEBHOOK_HOST,                 // пример: https://realtor-bot-t70.onrender.com  (без слэша в конце)
-  WEBHOOK_PATH_SECRET = 'hook', // пример: mysecretpath
+  WEBHOOK_HOST,              // например: https://realtor-bot-xxxx.onrender.com
+  WEBHOOK_PATH_SECRET = 'secret-path'
 } = process.env;
 
-if (!BOT_TOKEN || !OPENAI_API_KEY) {
-  console.error('❌ BOT_TOKEN или OPENAI_API_KEY не заданы');
-  process.exit(1);
-}
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN is missing');
+if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is missing');
+if (!WEBHOOK_HOST) console.warn('⚠️ WEBHOOK_HOST не задан: вебхук через API не установим');
 
-/* ========= CORE ========= */
-const app = express();
-const bot = new Telegraf(BOT_TOKEN);
+// Render выдаёт свой порт
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_PATH = `/telegraf/${WEBHOOK_PATH_SECRET}`;
+const WEBHOOK_URL = `${WEBHOOK_HOST}${WEBHOOK_PATH}`;
+
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 15_000 });
 
-/* ========= PRIMITIVE SESSION ========= */
+// ─────────── Память сессий по чатам ───────────
 const sessions = new Map();
+/** получить/создать сессию для чата */
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { step: 'idle', payload: {}, photos: [] });
+    sessions.set(chatId, {
+      target: null,      // "Продажа" | "Аренда" | "Презентация"
+      lang: 'ru',        // 'ru' | 'en' | 'sr' ...
+      meta: '',          // текст метаданных
+      photos: []         // [{fileId, fileUrl}]
+    });
   }
   return sessions.get(chatId);
 }
-function resetSession(chatId) {
-  sessions.set(chatId, { step: 'idle', payload: {}, photos: [] });
-}
 
-/* ========= HELPERS ========= */
-function chunkText(str, size = 3500) {
-  const parts = [];
-  let s = str || '';
-  while (s.length > size) {
-    let i = s.lastIndexOf('\n', size);
-    if (i < 0) i = size;
-    parts.push(s.slice(0, i));
-    s = s.slice(i);
-  }
-  if (s) parts.push(s);
-  return parts;
-}
-
-function parseMeta(text = '') {
-  const pick = (label) => (text.match(new RegExp(`\\*?${label}\\*?\\s*:\\s*([^\\n]+)`, 'i')) || [, ''])[1].trim();
-  const num = (s) => (s || '').replace(',', '.').match(/[0-9.]+/)?.[0] || '';
-  return {
-    address: pick('Адрес'),
-    district: pick('Район'),
-    totalArea: num(pick('Площадь')),
-    layout: pick('Планировка'),
-    floor: pick('Этаж'),
-    floorsTotal: pick('Этажность дома'),
-    ceilingHeight: pick('Потолки'),
-    communications: pick('Коммуникации'),
-    extras: pick('Особенности локации'),
-    petsPolicy: pick('Животные'),
-    availableFrom: pick('Доступно с'),
-    price: pick('Цена'),
-    contact: pick('Контакт'),
-  };
-}
-
-async function tgFileToDataUrl(ctx, fileId) {
-  const file = await ctx.telegram.getFile(fileId);
-  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-  const res = await fetch(url);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const mime = (file.file_path || '').toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
-  return `data:${mime};base64,${buf.toString('base64')}`;
-}
-
-/* ========= OPENAI: VISION EXTRACT ========= */
-const FEATURE_SCHEMA = {
-  type: "object",
-  properties: {
-    condition: { type: "string" },
-    furniture: { type: "array", items: { type: "string" } },
-    appliances: { type: "array", items: { type: "string" } },
-    standout_features: { type: "array", items: { type: "string" } },
-    possible_drawbacks: { type: "array", items: { type: "string" } },
-    confidence: { type: "string" }
-  },
-  required: ["condition","furniture","appliances","standout_features","possible_drawbacks","confidence"],
-  additionalProperties: true
+// ─────────── Утилиты ───────────
+const normalizeTarget = (t) => {
+  if (!t) return null;
+  const s = String(t).toLowerCase();
+  if (/(продажа|sell|sale)/i.test(s)) return 'Продажа';
+  if (/(аренда|rent|сдача)/i.test(s)) return 'Аренда';
+  if (/(презентац|presentation)/i.test(s)) return 'Презентация';
+  return null;
 };
 
-async function openaiExtractFeatures(imageDataUrls) {
-  const messages = [
-    { role: "system", content: [{ type: "text", text: "Ты помощник по недвижимости. Верни ТОЛЬКО валидный JSON по схеме без пояснений." }] },
-    {
-      role: "user",
-      content: [
-        { type: "text", text: `Схема:\n${JSON.stringify(FEATURE_SCHEMA, null, 2)}\nВерни чистый JSON.` },
-        ...imageDataUrls.map(u => ({ type: "image_url", image_url: { url: u, detail: "high" } }))
+const LANG_HINT = `Язык: ru/en/sr (пример: "Язык: ru")`;
+
+const META_TEMPLATE = `Пришли метаданные одним сообщением по образцу:
+
+Адрес: …
+Район: …
+Площадь: …
+Планировка: …
+Этаж: … / Этажность дома: …
+Потолки: …
+Коммуникации: …
+Особенности локации: …
+Животные: …
+Доступно с: …
+Цена: …
+Контакт: …`;
+
+// ─────────── Команды ───────────
+bot.start(async (ctx) => {
+  const chatId = ctx.chat.id;
+  sessions.delete(chatId); // сбрасываем
+  const kb = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🔁 Новый объект', callback_data: 'NEW_FLOW' }]
       ]
     }
-  ];
-  const r = await openai.chat.completions.create({ model: OPENAI_VISION_MODEL, messages, temperature: 0.2 });
-  const raw = r.choices?.[0]?.message?.content || "{}";
-  try { return JSON.parse(raw); } catch {
-    const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
-    if (s >= 0 && e >= 0) { try { return JSON.parse(raw.slice(s, e + 1)); } catch {} }
-    return {};
-  }
-}
-
-/* ========= OPENAI: COPY ========= */
-function buildListingPrompt(meta, feats) {
-  return `
-Составь объявление. Цель: ${meta.dealType}. Язык: ${meta.language}.
-Данные (мета): ${JSON.stringify(meta)}
-Признаки по фото: ${JSON.stringify(feats)}
-Структура:
-1) 3 коротких заголовка;
-2) Плюсы (5–8 буллетов);
-3) Минусы (2–5);
-4) Основной текст 6–10 предложений с учетом цели (продажа/аренда/презентация);
-5) Хэштеги (10–15, одной строкой);
-6) Призыв к действию с контактом: ${meta.contact || 'пишите в чат'}.
-`.trim();
-}
-
-async function openaiBuildListing(meta, feats) {
-  const r = await openai.chat.completions.create({
-    model: OPENAI_VISION_MODEL,
-    messages: [
-      { role: 'system', content: [{ type: 'text', text: 'Ты проф. копирайтер по недвижимости. Пиши ёмко и честно, без воды.' }] },
-      { role: 'user', content: [{ type: 'text', text: buildListingPrompt(meta, feats) }] }
-    ],
-    temperature: 0.4
-  });
-  return r.choices?.[0]?.message?.content || '';
-}
-
-/* ========= UI ========= */
-const dealKb = Markup.inlineKeyboard([
-  [Markup.button.callback('Продажа', 'deal_sale'), Markup.button.callback('Аренда', 'deal_rent')],
-  [Markup.button.callback('Презентация', 'deal_promo')]
-]);
-const langKb = Markup.inlineKeyboard([
-  [Markup.button.callback('Русский (ru)', 'lang_ru'), Markup.button.callback('Srpski (sr)', 'lang_sr')],
-  [Markup.button.callback('English (en)', 'lang_en')]
-]);
-const doneKb = Markup.inlineKeyboard([[Markup.button.callback('Готово, фото загружены ✅', 'photos_done')]]);
-
-/* ========= SCENARIO ========= */
-bot.start(async (ctx) => {
-  resetSession(ctx.chat.id);
-  await ctx.replyWithMarkdown('Привет! Я *Бот риелтор*. Набери */new* чтобы начать.');
-});
-
-bot.command('new', async (ctx) => {
-  resetSession(ctx.chat.id);
-  const s = getSession(ctx.chat.id);
-  s.step = 'deal';
-  await ctx.reply('Выбери цель:', dealKb);
-});
-
-bot.action(['deal_sale', 'deal_rent', 'deal_promo'], async (ctx) => {
-  const s = getSession(ctx.chat.id);
-  if (s.step !== 'deal') return ctx.answerCbQuery();
-  s.payload.dealType = { deal_sale: 'Продажа', deal_rent: 'Аренда', deal_promo: 'Презентация' }[ctx.callbackQuery.data];
-  s.step = 'lang';
-  await ctx.editMessageText(`Цель: ${s.payload.dealType}`);
-  await ctx.reply('Выбери язык:', langKb);
-});
-
-bot.action(['lang_ru', 'lang_sr', 'lang_en'], async (ctx) => {
-  const s = getSession(ctx.chat.id);
-  if (s.step !== 'lang') return ctx.answerCbQuery();
-  s.payload.language = { lang_ru: 'ru', lang_sr: 'sr', lang_en: 'en' }[ctx.callbackQuery.data];
-  s.step = 'meta';
-  await ctx.editMessageText(`Язык: ${s.payload.language}`);
-  await ctx.replyWithMarkdown(
-`Пришли **метаданные** одним сообщением по образцу:
-
-*Адрес:* ...
-*Район:* ...
-*Площадь:* 45
-*Планировка:* 1к
-*Этаж:* 3
-*Этажность дома:* 9
-*Потолки:* 2.7
-*Коммуникации:* ...
-*Особенности локации:* ...
-*Животные:* ...
-*Доступно с:* ...
-*Цена:* ...
-*Контакт:* ...
-
-После этого пришли 3–12 фото (можно альбомом).`
+  };
+  await ctx.reply(
+    `Привет! Я бот-риелтор. Сгенерирую объявление с фото.\n\n` +
+    `Нажми «Новый объект» или отправь /new.\n` +
+    `После — ${LANG_HINT}`,
+    kb
   );
 });
 
+bot.command('new', async (ctx) => {
+  const chatId = ctx.chat.id;
+  sessions.delete(chatId);
+  const s = getSession(chatId);
+
+  // Попробуем считать цель из аргументов команды: "/new Продажа"
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  const tgt = normalizeTarget(arg);
+  if (tgt) s.target = tgt;
+
+  await ctx.reply(`Цель: ${s.target ? s.target : 'не задана'}\n${LANG_HINT}`);
+  await ctx.reply(META_TEMPLATE);
+  await ctx.reply('После метаданных — пришли 3–12 фото (можно альбомом). Когда закончишь — нажми кнопку ниже.', {
+    reply_markup: { inline_keyboard: [[{ text: 'Готово, фото загружены ✅', callback_data: 'PHOTOS_DONE' }]] }
+  });
+});
+
+// Выбор языка: "Язык: ru"
+bot.hears(/^\s*язык\s*:\s*([a-z]{2})\s*$/i, async (ctx) => {
+  const lang = ctx.match[1].toLowerCase();
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  s.lang = lang;
+  await ctx.reply(`Ок, язык: ${lang.toUpperCase()}`);
+});
+
+// Установка цели: пользователь может просто написать "Продажа" после /new
+bot.hears(/^(продажа|аренда|презентация)$/i, async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  s.target = normalizeTarget(ctx.message.text) || s.target;
+  await ctx.reply(`Цель: ${s.target || 'не распознана'}`);
+});
+
+// Принимаем метаданные — первое «произвольное» текстовое сообщение после /new
 bot.on('text', async (ctx, next) => {
-  const s = getSession(ctx.chat.id);
-  if (s.step === 'meta') {
-    s.payload = { ...s.payload, ...parseMeta(ctx.message.text) };
-    s.step = 'collect_photos';
-    await ctx.reply('Принял метаданные. Пришли 3–12 фото. Когда закончишь — нажми кнопку.', doneKb);
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+
+  const txt = (ctx.message?.text || '').trim();
+
+  // служебные фразы пропустим дальше
+  if (
+    /^\/(start|new|help)/i.test(txt) ||
+    /^язык\s*:/i.test(txt) ||
+    /^(продажа|аренда|презентация)$/i.test(txt) ||
+    /создай\s+описание/i.test(txt)
+  ) return next();
+
+  // если ещё нет метаданных — примем это сообщение как метаданные
+  if (!s.meta) {
+    s.meta = txt;
+    await ctx.reply('Принял метаданные. Пришли 3–12 фото. Когда закончишь — нажми кнопку ниже.', {
+      reply_markup: { inline_keyboard: [[{ text: 'Готово, фото загружены ✅', callback_data: 'PHOTOS_DONE' }]] }
+    });
     return;
   }
+
   return next();
 });
 
-bot.on('photo', async (ctx, next) => {
-  const s = getSession(ctx.chat.id);
-  if (s.step !== 'collect_photos') return next();
-  const best = (ctx.message.photo || []).sort((a, b) => (b.file_size || 0) - (a.file_size || 0))[0];
-  if (best) {
-    s.photos.push({ file_id: best.file_id });
-    await ctx.reply(`Фото добавлено ✅ (всего: ${s.photos.length})`, { reply_to_message_id: ctx.message.message_id });
-  }
-});
+// Фото (одиночные и в альбомах)
+bot.on('photo', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
 
-bot.action('photos_done', async (ctx) => {
-  const s = getSession(ctx.chat.id);
-  if (s.step !== 'collect_photos') return ctx.answerCbQuery();
-  if (s.photos.length < 1) return ctx.answerCbQuery('Сначала пришли фото', { show_alert: true });
-
-  await ctx.editMessageText(`Фото получены: ${s.photos.length}. Анализирую…`);
   try {
-    const imgs = [];
-    for (const p of s.photos.slice(0, 12)) imgs.push(await tgFileToDataUrl(ctx, p.file_id));
+    const photos = ctx.message.photo;
+    if (!photos?.length) return;
+    // Берём самое большое превью
+    const fileId = photos[photos.length - 1].file_id;
+    const link = await ctx.telegram.getFileLink(fileId);
 
-    await ctx.reply('🔎 Извлекаю признаки…');
-    const feats = await openaiExtractFeatures(imgs);
+    if (!s.photos.find(p => p.fileId === fileId)) {
+      s.photos.push({ fileId, fileUrl: link.href });
+    }
 
-    await ctx.reply('📝 Собираю текст…');
-    const text = await openaiBuildListing(s.payload, feats);
-
-    await ctx.replyWithMarkdown('*Извлечённые признаки (JSON):*');
-    await ctx.reply('```\n' + JSON.stringify(feats, null, 2) + '\n```', { parse_mode: 'Markdown' });
-
-    await ctx.replyWithMarkdown('*Готовый текст объявления:*');
-    for (const part of chunkText(text, 3500)) await ctx.reply(part);
-
-    await ctx.reply('Готово ✅ /new чтобы начать заново');
-  } catch (e) {
-    console.error(e);
-    await ctx.reply('❌ Ошибка. Проверь ключи/переменные и попробуй /new');
-  } finally {
-    resetSession(ctx.chat.id);
+    await ctx.reply(`Фото добавлено ✅ (всего: ${s.photos.length})`, {
+      reply_to_message_id: ctx.message.message_id
+    });
+  } catch (err) {
+    console.error('PHOTO_HANDLER_ERROR:', err);
+    await ctx.reply('Не удалось принять фото 😔. Пришли ещё раз.');
   }
 });
 
-/* ========= START: WEBHOOK or POLLING ========= */
-const PORT = process.env.PORT || 3000;            // <-- не задаём в env вручную
+// Кнопка «Готово, фото загружены ✅»
+bot.action('PHOTOS_DONE', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  await ctx.answerCbQuery();
 
-if (WEBHOOK_HOST) {
-  const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
-  app.use(express.json());
+  if (!s.photos.length) {
+    return ctx.reply('Пока нет ни одного фото. Пришли 3–12 фото и снова нажми кнопку.');
+  }
 
-  // health & GET-checks
-  app.get('/', (_, res) => res.status(200).send('OK'));
-  app.get(path, (_, res) => res.status(200).send('OK'));
+  await ctx.reply('Готово, фото загружены ✅');
+  await ctx.reply('Теперь напиши: «Создай описание».');
+});
 
-  // основной обработчик вебхука (POST)
-  app.post(path, bot.webhookCallback(path));
+// Генерация — по фразе «Создай описание»
+bot.hears(/создай\s+описание/i, async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
 
-  // регистрируем webhook (без лишних перезапросов порта)
-  bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
+  if (!s.photos.length) {
+    return ctx.reply('Нужно сначала прислать 3–12 фото и нажать «Готово, фото загружены ✅».');
+  }
 
-  // запускаем HTTP-сервер на выданном Render порту
-  const server = app.listen(PORT, () => {
-    console.log(`✅ Webhook server on ${PORT}, path=${path}`);
+  const MAX_IMAGES = 8;                    // ограничим для Vision
+  const imgs = s.photos.slice(0, MAX_IMAGES);
+
+  const system = `Ты опытный риелтор. Пишешь продающие объявления которые цепляют с первых двух строчек. Пиши кратко и убедительно.
+Структура:
+1) Заголовок (тип сделки, метраж, район/улица)
+2) Описание: планировка, состояние, мебель/техника, коммуникации, этаж/этажность
+3) Особенности и локация
+4) Условия сделки (цена, доступно с, контакты)
+5) Блок «Для площадок»: 3–5 ключевых преимуществ в виде списка
+
+Без воды, цифры и факты. Язык: ${s.lang || 'ru'}. Цель: ${s.target || 'Продажа'}.`;
+
+  const userText = `Сгенерируй объявление по метаданным и фото.
+
+Метаданные:
+${s.meta || '(метаданных нет)'}.
+
+Используй вид из фото: ремонт, техника, мебель, санузел, кухня, покрытие пола, окна/вид, состояние подъезда/дома, и т.д.`;
+
+  try {
+    await ctx.reply('Генерирую описание… 10–20 секунд ⏳');
+
+    const userContent = [
+      { type: 'text', text: userText },
+      ...imgs.map(p => ({ type: 'image_url', image_url: { url: p.fileUrl } }))
+    ];
+
+    // OpenAI Vision
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_VISION_MODEL,
+      temperature: 0.7,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userContent }
+      ]
+    });
+
+    const draft = completion.choices?.[0]?.message?.content?.trim();
+    if (!draft) throw new Error('Empty completion');
+
+    await ctx.reply(draft, { disable_web_page_preview: true });
+
+    // Сброс под новый объект (язык/цель оставим)
+    sessions.set(chatId, {
+      target: s.target,
+      lang: s.lang,
+      meta: '',
+      photos: []
+    });
+
+  } catch (err) {
+    console.error('DESCRIBE_ERROR:', err);
+    const msg =
+      err?.status === 401 ? 'Ошибка 401 у OpenAI (ключ?). Проверь OPENAI_API_KEY в Render → Environment.'
+    : err?.status === 429 ? 'Перегрузка/лимит OpenAI (429). Подожди минуту или проверь биллинг.'
+    : 'Не вышло создать описание 😔. Я записал ошибку в логи Render.';
+    await ctx.reply(msg);
+  }
+});
+
+// Кнопка «Новый объект» из /start
+bot.action('NEW_FLOW', async (ctx) => {
+  await ctx.answerCbQuery();
+  sessions.delete(ctx.chat.id);
+  await ctx.reply('Ок! Новый объект. Сначала выбери цель (просто напиши: Продажа/Аренда/Презентация), затем задай язык — ' + LANG_HINT);
+  await ctx.reply(META_TEMPLATE);
+  await ctx.reply('После метаданных пришли 3–12 фото и нажми кнопку ниже.', {
+    reply_markup: { inline_keyboard: [[{ text: 'Готово, фото загружены ✅', callback_data: 'PHOTOS_DONE' }]] }
   });
-  server.on('error', (err) => {
-    console.error('HTTP server error:', err);
-    process.exit(1);
-  });
-} else {
-  // fallback: polling
-  bot.launch().then(() => console.log('✅ Bot started in polling mode'));
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
-}
+});
 
+// ─────────── Express + Webhook ───────────
+const app = express();
 
+// Чтобы Telegram видел «живой» корень
+app.get('/', (req, res) => res.type('text/plain').send('OK'));
+
+// Подключаем webhook callback Telegraf
+app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+// Запуск сервера
+app.listen(PORT, async () => {
+  console.log(`✅ Webhook server on ${PORT}, path=${WEBHOOK_PATH}`);
+
+  // Пытаемся поставить вебхук автоматически (если есть WEBHOOK_HOST)
+  try {
+    if (WEBHOOK_HOST) {
+      await bot.telegram.setWebhook(WEBHOOK_URL);
+      console.log('WEBHOOK_READY:', WEBHOOK_URL);
+    } else {
+      console.log('WEBHOOK_NOT_SET: задайте WEBHOOK_HOST в ENV и поставьте вебхук руками через Telegram API.');
+    }
+  } catch (err) {
+    console.error('SET_WEBHOOK_ERROR:', err);
+  }
+});
