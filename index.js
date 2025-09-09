@@ -257,3 +257,18 @@ if (WEBHOOK_HOST) {
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
+const path = `/telegraf/${WEBHOOK_PATH_SECRET}`;
+app.use(express.json());
+
+// Эти два GET-роута нужны, чтобы не было 404 при проверках браузером/Телеграмом
+app.get('/', (_, res) => res.status(200).send('OK'));
+app.get(path, (_, res) => res.status(200).send('OK'));
+
+// ВАЖНО: сам обработчик POST на вебхуке
+app.post(path, bot.webhookCallback(path));
+
+// Установка вебхука
+bot.telegram.setWebhook(`${WEBHOOK_HOST}${path}`, { drop_pending_updates: true });
+
+app.listen(PORT, () => console.log(`✅ Webhook server on ${PORT}, path=${path}`));
+
