@@ -10,7 +10,6 @@ const {
   BOT_TOKEN,
   OPENAI_API_KEY,
   OPENAI_VISION_MODEL = 'gpt-4o-mini',
-  PORT = 10000,
   WEBHOOK_HOST,                 // пример: https://realtor-bot-t70.onrender.com  (без слэша в конце)
   WEBHOOK_PATH_SECRET = 'hook', // пример: mysecretpath
 } = process.env;
@@ -286,4 +285,5 @@ if (WEBHOOK_HOST) {
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
+
 
