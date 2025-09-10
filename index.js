@@ -81,7 +81,7 @@ bot.start(async (ctx) => {
     }
   };
   await ctx.reply(
-    `Привет! Я бот-риелтор. Сгенерирую объявление с фото.\n\n` +
+    `Привет! Давай я составлю объявление по фото.\n\n` +
     `Нажми «Новый объект» или отправь /new.\n` +
     `После — ${LANG_HINT}`,
     kb
@@ -323,5 +323,6 @@ app.listen(PORT, async () => {
     console.error('SET_WEBHOOK_ERROR:', err);
   }
 });
+
 
 
